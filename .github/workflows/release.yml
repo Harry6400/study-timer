@@ -1,0 +1,53 @@
+name: macOS Release
+on:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: macos-26
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      STUDYTIMER_BUILD_ROOT: ${{ runner.temp }}/studytimer-release
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test
+        run: ./scripts/test.sh
+      - name: Package and verify
+        run: ./scripts/package-release.sh "$RELEASE_TAG"
+      - name: Create draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          macOS 原生悬浮学习计时器，支持正计时、倒计时、双圆环时间轴、拖动编辑、趋势统计与本地备份。
+
+          **支持环境：Apple Silicon（M 系列）Mac，macOS 26 或更高版本。**
+
+          - `StudyTimer-macOS-arm64.dmg`：打开后将应用拖入 Applications。
+          - `StudyTimer-macOS-arm64.zip`：解压后将应用移入“应用程序”。
+          - `SHA256SUMS.txt`：安装包的 SHA-256 校验值。
+
+          当前版本采用本地签名，**未经过 Apple 公证**。首次打开的系统提示及处理方式见仓库 README。学习数据仅存储在本机。
+          NOTES
+          existing="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "$existing" == "false" ]]; then
+            echo "该版本已公开发布，不自动覆盖其安装包。" >&2
+            exit 1
+          fi
+          if [[ "$existing" == "true" ]]; then
+            gh release upload "$RELEASE_TAG" dist/StudyTimer-macOS-arm64.dmg dist/StudyTimer-macOS-arm64.zip dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" --draft --verify-tag --title "StudyTimer $RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md" dist/StudyTimer-macOS-arm64.dmg dist/StudyTimer-macOS-arm64.zip dist/SHA256SUMS.txt
+          fi
