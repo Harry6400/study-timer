@@ -34,6 +34,9 @@ public struct Backup: Codable, Sendable {
         if let checkpoint = timer.checkpoint {
             guard checkpoint.timeIntervalSince1970.isFinite, checkpoint <= now.addingTimeInterval(1) else { throw StudyError.invalidBackup }
         }
+        if let day = timer.studyDayStart {
+            guard day.timeIntervalSince1970.isFinite else { throw StudyError.invalidBackup }
+        }
         if let start = timer.activeStart {
             guard start.timeIntervalSince1970.isFinite, let checkpoint = timer.checkpoint, start <= checkpoint else { throw StudyError.invalidBackup }
         }

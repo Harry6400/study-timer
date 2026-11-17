@@ -44,7 +44,7 @@ import StudyTimerCore
             if CommandLine.arguments.contains("--verification-month") { model.preferences.statisticsLayout = .trend }
         }
         if CommandLine.arguments.contains("--resume-after-update"), model.engine.state.status == .paused {
-            model.toggle()
+            model.resumeAfterUpdate()
         }
         floating = FloatingController(model: model)
         floating.showStatistics = { [weak self] in self?.showStatistics() }
@@ -132,7 +132,11 @@ import StudyTimerCore
         guard model != nil else { return .terminateNow }
         guard !model.isMutating else { return .terminateCancel }
         terminationStarted = true
-        Task { await model.quit(); NSApp.reply(toApplicationShouldTerminate: true) }
+        Task {
+            let saved = await model.quit()
+            if !saved { terminationStarted = false }
+            NSApp.reply(toApplicationShouldTerminate: saved)
+        }
         return .terminateLater
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -157,6 +161,7 @@ import StudyTimerCore
         value.setContentSize(size); value.center(); return value
     }
     @objc private func showStatistics() {
+        model.openedStatistics()
         if statisticsWindow == nil {
             let controller = NSHostingController(rootView: StatisticsView(model: model))
             controller.sizingOptions = []
@@ -167,8 +172,10 @@ import StudyTimerCore
                          NSWindow.didDeminiaturizeNotification, NSWindow.willCloseNotification] {
                 let observer = NotificationCenter.default.addObserver(forName: name, object: statisticsWindow, queue: .main) { [weak self] notification in
                     let isClosing = notification.name == NSWindow.willCloseNotification
+                    let isRestoring = notification.name == NSWindow.didDeminiaturizeNotification
                     MainActor.assumeIsolated {
                         guard let self, let window = self.statisticsWindow else { return }
+                        if isRestoring { self.model.openedStatistics() }
                         self.model.statisticsVisible = !isClosing && window.isVisible && window.occlusionState.contains(.visible) && !window.isMiniaturized
                     }
                 }

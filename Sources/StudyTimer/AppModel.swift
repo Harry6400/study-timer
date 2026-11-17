@@ -35,11 +35,13 @@ private final class InstanceLock {
     let statisticsReadout = LiveReadout()
     let controlsReadout = LiveReadout()
     var statisticsVisible = false {
-        didSet { if statisticsVisible { statisticsReadout.update(now: Date(), interval: engine.liveInterval) } }
+        didSet { if statisticsVisible { statisticsReadout.update(now: now, interval: engine.liveInterval) } }
     }
     @Published private(set) var records: [StudyInterval] = []
     @Published private(set) var studyDay = StudyCalendar().dayStart(for: Date())
     @Published private(set) var isMutating = false
+    @Published private(set) var settlementPending = false
+    @Published private(set) var statisticsPresentation = 0
     @Published var modalDepth = 0
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
@@ -60,6 +62,10 @@ private final class InstanceLock {
     private let instanceLock: InstanceLock
     private let backups: BackupService
     private let notifications: NotificationService?
+    private let time: any TimeSource
+    private let calendarOverride: StudyCalendar?
+    var now: Date { time.date }
+    var studyCalendar: StudyCalendar { calendarOverride ?? StudyCalendar() }
     private let pauseTimer = TransientPauseTimer()
     private var history = RecordHistory()
     private var ticker: Timer?
@@ -71,7 +77,10 @@ private final class InstanceLock {
     private var dailyRequested = false
     private var dailyTask: Task<Void, Never>?
 
-    init(directoryOverride: URL? = nil) throws {
+    init(directoryOverride: URL? = nil, time: any TimeSource = SystemTimeSource(), calendar: StudyCalendar? = nil) throws {
+        self.time = time; calendarOverride = calendar
+        let currentCalendar = calendar ?? StudyCalendar()
+        studyDay = currentCalendar.dayStart(for: time.date)
         let fallback = Bundle.main.object(forInfoDictionaryKey: "StudyTimerVerificationDirectory") as? String
         let args = CommandLine.arguments + (fallback.map { ["--data-directory", $0] } ?? [])
         if let directoryOverride {
@@ -88,9 +97,9 @@ private final class InstanceLock {
         preferences = defaults.data(forKey: "preferences").flatMap { try? JSONDecoder().decode(Preferences.self, from: $0) } ?? Preferences()
         instanceLock = try InstanceLock(directory: directory)
         store = try HistoryStore(directory: directory)
-        engine = TimerEngine(state: try store.timerState())
+        engine = TimerEngine(state: try store.timerState(), time: time, calendar: currentCalendar)
         let loaded = try store.intervals()
-        index = StatisticsIndex(records: loaded)
+        index = StatisticsIndex(records: loaded, calendar: currentCalendar)
         records = loaded
         backups = BackupService(directory: directory)
         notifications = directoryOverride == nil ? NotificationService() : nil
@@ -98,7 +107,11 @@ private final class InstanceLock {
         if let recovered = engine.recoveredAt {
             let formatter = DateFormatter(); formatter.dateFormat = "M月d日 HH:mm:ss"
             message = "上次未正常退出，已恢复到 \(formatter.string(from: recovered)) 并暂停。"
-            try store.save(TimerUpdate(state: engine.state, interval: nil))
+        }
+        if let update = engine.initialUpdate {
+            settlementPending = engine.settledOnLoad
+            if settlementPending { notifications?.cancel() }
+            persist(update)
         }
         configureTicker(); scheduleBoundary(); publishReadings(); queueDailyBackup()
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
@@ -115,78 +128,110 @@ private final class InstanceLock {
     func totals(on days: [Date], live: StudyInterval? = nil) -> [DayTotal] { index.totals(on: days, live: live) }
     func liveAffects(_ days: [Date]) -> Bool {
         guard let start = engine.state.activeStart else { return false }
-        let now = engine.liveInterval?.end ?? Date()
-        let calendar = StudyCalendar()
+        let now = engine.liveInterval?.end ?? self.now
+        let calendar = studyCalendar
         return days.contains { $0 <= now && calendar.nextDay($0) > start }
     }
-    var todayTotal: TimeInterval { index.total(on: Date(), live: engine.liveInterval) }
+    var todayTotal: TimeInterval { index.total(on: now, live: engine.liveInterval) }
     var pauseElapsed: TimeInterval? { pauseTimer.elapsed }
     var isRunning: Bool { engine.state.status == .running }
     var activeID: UUID? { engine.state.activeID }
-    var shortcutEnabled: Bool { modalDepth == 0 && !isMutating }
+    var shortcutEnabled: Bool { modalDepth == 0 && !isMutating && !settlementPending }
     var backupDirectory: URL { directory.appendingPathComponent("自动备份", isDirectory: true) }
     var statusText: String {
-        switch engine.state.status { case .running: "计时中"; case .paused: "已暂停"; case .completed: "已完成" }
+        if settlementPending { return "日结算待保存" }
+        return switch engine.state.status { case .running: "计时中"; case .paused: "已暂停"; case .completed: "已完成" }
     }
     func start(text: String) throws {
+        reconcileDay()
+        guard !settlementPending else { throw StudyError.storage("凌晨4点结算尚未保存，请稍后重试") }
         let target = try TimeInput.parse(text)
         pauseTimer.clear(); persist(engine.start(target: target))
         scheduleReminder(); transition()
     }
     func toggle() {
+        reconcileDay()
+        guard !settlementPending else { return }
         if isRunning {
             let update = engine.pause()
-            if engine.state.status == .paused { pauseTimer.start() } else { pauseTimer.clear() }
+            if engine.state.status == .paused && !update.isDaySettlement { pauseTimer.start() } else { pauseTimer.clear() }
             persist(update)
             if engine.state.status == .completed { notifications?.finished(preferences: preferences) }
             else { notifications?.cancel() }
         } else { pauseTimer.clear(); persist(engine.resume()); scheduleReminder() }
         transition(); queueDailyBackup()
     }
+    func resumeAfterUpdate() {
+        guard !engine.settledOnLoad && !settlementPending && engine.state.status == .paused else { return }
+        pauseTimer.clear()
+        let update = engine.resume(allowNewDay: false)
+        persist(update)
+        if !update.isDaySettlement { scheduleReminder() }
+        reconcileDay(); transition(); queueDailyBackup()
+    }
     func reset() {
+        reconcileDay()
+        guard !settlementPending else { return }
         pauseTimer.clear(); persist(engine.reset()); notifications?.cancel(); transition(); queueDailyBackup()
     }
     private func transition() {
         objectWillChange.send(); configureTicker(); publishReadings(); onUpdate?()
     }
     private func scheduleReminder() {
-        if isRunning, let target = engine.state.target {
-            notifications?.schedule(after: max(0, target - engine.elapsed), preferences: preferences)
+        if let remaining = countdownReminderDelay {
+            notifications?.schedule(after: remaining, preferences: preferences)
         } else { notifications?.cancel() }
+    }
+    var countdownReminderDelay: TimeInterval? {
+        guard isRunning, let target = engine.state.target else { return nil }
+        let remaining = max(0, target - engine.elapsed)
+        return remaining > 0 && remaining < engine.nextStudyDayBoundary.timeIntervalSince(now) ? remaining : nil
     }
     func reminderPreferencesChanged() { scheduleReminder() }
     private func configureTicker() {
         ticker?.invalidate(); ticker = nil
-        guard isRunning || pauseTimer.isActive else { return }
+        guard isRunning || pauseTimer.isActive || !pendingWrites.isEmpty else { return }
         let value = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+            MainActor.assumeIsolated { self?.synchronizeTime() }
         }
         value.tolerance = 0.06; RunLoop.main.add(value, forMode: .common); ticker = value
     }
     private func publishReadings() {
-        let now = Date(), live = engine.liveInterval
+        let now = self.now, live = engine.liveInterval
         controlsReadout.update(now: now, interval: live)
         if statisticsVisible { statisticsReadout.update(now: now, interval: live) }
     }
-    private func tick() {
+    func synchronizeTime() {
+        reconcileDay()
         if isRunning {
             if let finished = engine.tick() {
-                pauseTimer.clear(); persist(finished); notifications?.finished(preferences: preferences)
+                pauseTimer.clear(); persist(finished)
+                if finished.isDaySettlement { notifications?.cancel() }
+                else { notifications?.finished(preferences: preferences) }
                 transition(); queueDailyBackup()
             } else if lastCheckpoint.duration(to: .now) >= .seconds(15) { checkpoint() }
             if lastDaily.duration(to: .now) >= .seconds(1800) { queueDailyBackup() }
         }
-        refreshDay(); publishReadings(); onUpdate?()
+        publishReadings(); onUpdate?()
     }
     func checkpoint() {
+        reconcileDay()
+        guard !settlementPending else { return }
         let wasRunning = isRunning
-        persist(engine.checkpoint())
+        let update = engine.checkpoint()
+        persist(update)
         if wasRunning && !isRunning {
-            pauseTimer.clear(); notifications?.finished(preferences: preferences); transition(); queueDailyBackup()
+            pauseTimer.clear()
+            if update.isDaySettlement { notifications?.cancel() }
+            else { notifications?.finished(preferences: preferences) }
+            transition(); queueDailyBackup()
         }
     }
-    @discardableResult private func persist(_ update: TimerUpdate) -> Bool {
-        pendingWrites.append(update)
+    @discardableResult private func persist(_ update: TimerUpdate? = nil) -> Bool {
+        if let update {
+            if update.isDaySettlement { settlementPending = true; pauseTimer.clear(); notifications?.cancel() }
+            pendingWrites.append(update)
+        }
         do {
             while let next = pendingWrites.first {
                 try store.save(next)
@@ -195,33 +240,54 @@ private final class InstanceLock {
                 }
                 pendingWrites.removeFirst()
             }
-            lastCheckpoint = .now; storageFailed = false; return true
+            let wasBlocked = settlementPending || storageFailed
+            lastCheckpoint = .now; storageFailed = false; settlementPending = false
+            if wasBlocked {
+                if message?.hasPrefix("凌晨4点结算尚未保存：") == true { message = nil }
+                configureTicker(); queueDailyBackup()
+            }
+            return true
         } catch {
-            if !storageFailed { message = error.localizedDescription }
-            storageFailed = true; return false
+            let detail = settlementPending ? "凌晨4点结算尚未保存：" + error.localizedDescription : error.localizedDescription
+            if !storageFailed || message != detail { message = detail }
+            storageFailed = true; configureTicker(); return false
         }
     }
     private func scheduleBoundary() {
         boundaryTimer?.invalidate()
-        let next = StudyCalendar().nextDay(StudyCalendar().dayStart(for: Date()))
-        let timer = Timer(fire: next, interval: 0, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshDay(); self?.publishReadings(); self?.onUpdate?(); self?.scheduleBoundary() }
+        let next = studyCalendar.nextDay(studyCalendar.dayStart(for: now))
+        let timer = Timer(timeInterval: max(0.01, next.timeIntervalSince(now)), repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.synchronizeTime(); self?.scheduleBoundary() }
         }
         RunLoop.main.add(timer, forMode: .common); boundaryTimer = timer
     }
-    private func refreshDay() {
-        let day = StudyCalendar().dayStart(for: Date())
+    private func reconcileDay() {
+        if let update = engine.settleDayIfNeeded(calendar: studyCalendar) {
+            settlementPending = true
+            pauseTimer.clear(); notifications?.cancel()
+            persist(update); transition(); queueDailyBackup()
+        } else if !pendingWrites.isEmpty { persist() }
+        let day = studyCalendar.dayStart(for: now)
         if studyDay != day { studyDay = day; queueDailyBackup() }
     }
     @objc private func calendarChanged() {
-        index = StatisticsIndex(records: records); objectWillChange.send()
-        refreshDay(); scheduleBoundary(); publishReadings(); onUpdate?()
+        reconcileDay()
+        index = StatisticsIndex(records: records, calendar: studyCalendar); objectWillChange.send()
+        scheduleBoundary(); publishReadings(); onUpdate?()
     }
     @objc private func willSleep() { checkpoint() }
-    @objc private func didWake() { calendarChanged(); tick() }
-    func quit() async {
-        pauseTimer.clear(); persist(engine.pause()); notifications?.cancel(); ticker?.invalidate(); boundaryTimer?.invalidate()
+    @objc private func didWake() { calendarChanged(); synchronizeTime() }
+    func openedStatistics() {
+        synchronizeTime(); statisticsPresentation &+= 1
+    }
+    @discardableResult func quit() async -> Bool {
+        reconcileDay()
+        guard !settlementPending else { return false }
+        pauseTimer.clear(); notifications?.cancel()
+        guard persist(engine.pause()) else { return false }
+        ticker?.invalidate(); boundaryTimer?.invalidate()
         queueDailyBackup(); await dailyTask?.value
+        return true
     }
 
     func saveInterval(_ interval: StudyInterval) async throws {
@@ -234,26 +300,31 @@ private final class InstanceLock {
     func undoRecord() async throws { if let change = history.undo { try await perform(change.reversed, mode: -1) } }
     func redoRecord() async throws { if let change = history.redo { try await perform(change, mode: 1) } }
     private func perform(_ change: RecordChange, mode: Int) async throws {
+        reconcileDay()
+        guard !settlementPending else { throw StudyError.storage("凌晨4点结算尚未保存，请稍后重试") }
         guard !isMutating else { throw StudyError.storage("正在处理上一项操作") }
         guard change.before != change.after else { return }
         guard change.id != activeID else { throw StudyError.storage("请先暂停，再修改当前时段") }
         isMutating = true; defer { isMutating = false }
-        if let after = change.after { try HistoryStore.validate(after, against: liveRecords) }
+        if let after = change.after { try HistoryStore.validate(after, against: liveRecords, now: now) }
         guard pendingWrites.isEmpty else { throw StudyError.storage("计时检查点尚未保存，请稍后重试") }
         if preferences.automaticBackups { try await beforeChangeBackup() }
-        if let after = change.after { try HistoryStore.validate(after, against: liveRecords) }
-        try store.apply(change)
+        reconcileDay()
+        guard !settlementPending && pendingWrites.isEmpty else { throw StudyError.storage("计时记录尚未保存，请稍后重试") }
+        if let after = change.after { try HistoryStore.validate(after, against: liveRecords, now: now) }
+        try store.apply(change, now: now)
         index.replace(id: change.id, with: change.after); records = index.records
         if mode == -1 { history.didUndo() } else if mode == 1 { history.didRedo() } else { history.record(change) }
         canUndo = history.undo != nil; canRedo = history.redo != nil
         publishReadings(); onUpdate?(); queueDailyBackup()
     }
     func snapshot() -> Backup {
+        reconcileDay()
         let value = engine.snapshot()
         var saved = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
         for update in pendingWrites { if let interval = update.interval { saved[interval.id] = interval } }
         if let live = value.interval { saved[live.id] = live }
-        return Backup(intervals: saved.values.sorted { $0.start < $1.start }, timer: value.state, preferences: preferences)
+        return Backup(intervals: saved.values.sorted { $0.start < $1.start }, timer: value.state, preferences: preferences, createdAt: now)
     }
     private func backupSucceeded(_ date: Date) {
         lastBackup = date; backupError = nil; defaults.set(date, forKey: "lastAutomaticBackup")
@@ -286,17 +357,25 @@ private final class InstanceLock {
     func exportBackup(to url: URL) async throws { try await backups.export(snapshot(), to: url) }
     func exportCSV(to url: URL) throws { try Data(StudyCalendar().csv(liveRecords).utf8).write(to: url, options: .atomic) }
     func restore(from url: URL) async throws {
+        reconcileDay()
+        guard !settlementPending else { throw StudyError.storage("凌晨4点结算尚未保存，请稍后重试") }
         guard !isMutating else { throw StudyError.storage("正在处理上一项操作") }
-        let replacement = try Backup.decode(Data(contentsOf: url))
+        let replacement = try Backup.decode(Data(contentsOf: url), now: now)
         isMutating = true; defer { isMutating = false }
         // 完整恢复无论自动备份开关如何，始终先保留原始数据。
         try await beforeChangeBackup()
-        try store.restore(replacement)
+        reconcileDay()
+        guard !settlementPending else { throw StudyError.storage("凌晨4点结算尚未保存，请稍后重试") }
+        try store.restore(replacement, now: now)
         notifications?.cancel(); pauseTimer.clear(); pendingWrites.removeAll()
-        engine = TimerEngine(state: try store.timerState())
-        let loaded = try store.intervals(); index = StatisticsIndex(records: loaded); records = loaded
+        engine = TimerEngine(state: try store.timerState(), time: time, calendar: studyCalendar)
+        let loaded = try store.intervals(); index = StatisticsIndex(records: loaded, calendar: studyCalendar); records = loaded
+        if let update = engine.initialUpdate {
+            settlementPending = engine.settledOnLoad
+            persist(update)
+        }
         history.clear(); canUndo = false; canRedo = false
         preferences = replacement.preferences
-        refreshDay(); transition(); queueDailyBackup()
+        reconcileDay(); transition(); queueDailyBackup()
     }
 }

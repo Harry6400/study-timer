@@ -22,13 +22,18 @@ public struct TimerState: Codable, Equatable, Sendable {
     public var activeID: UUID?
     public var checkpoint: Date?
     public var checkpointElapsed: TimeInterval = 0
+    /// 这次读数所属的学习日；旧数据由活动起点或检查点推断。
+    public var studyDayStart: Date?
     public init(target: TimeInterval? = nil) { self.target = target }
 }
 
 public struct TimerUpdate: Sendable {
     public var state: TimerState
     public var interval: StudyInterval?
-    public init(state: TimerState, interval: StudyInterval?) { self.state = state; self.interval = interval }
+    public var isDaySettlement: Bool
+    public init(state: TimerState, interval: StudyInterval?, isDaySettlement: Bool = false) {
+        self.state = state; self.interval = interval; self.isDaySettlement = isDaySettlement
+    }
 }
 
 public enum TimerTheme: String, Codable, CaseIterable, Sendable {

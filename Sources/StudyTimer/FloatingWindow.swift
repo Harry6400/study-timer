@@ -299,10 +299,13 @@ private struct ControlsView: View {
             TextField("时间", text: $input)
                 .font(.system(size: 23, weight: .medium)).textFieldStyle(.plain)
                 .focused($focused).onSubmit(start).accessibilityLabel("计时时间")
+                .disabled(model.settlementPending)
             Divider()
             HStack(spacing: 10) {
                 control(model.isRunning ? "pause.fill" : "play.fill", model.isRunning ? "暂停" : "继续", model.toggle)
+                    .disabled(model.settlementPending)
                 control("arrow.counterclockwise", "重置", model.reset)
+                    .disabled(model.settlementPending)
                 control("chart.bar.xaxis", "学习统计", statistics)
                 control("gearshape", "设置", settings)
                 control(model.preferences.alwaysOnTop ? "pin.fill" : "pin.slash", "切换置顶") { model.preferences.alwaysOnTop.toggle() }

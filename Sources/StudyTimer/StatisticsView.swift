@@ -8,7 +8,7 @@ private enum WeekWindow: Int { case recent, current }
 
 struct StatisticsView: View {
     @ObservedObject var model: AppModel
-    @State private var date = StudyCalendar().dayStart(for: Date())
+    @State private var selection = StatisticsSelection(today: StudyCalendar().dayStart(for: Date()))
     @State private var trendPeriod = CommandLine.arguments.contains("--verification-month") ? TrendPeriod.month : TrendPeriod.week
     @State private var weekWindow = WeekWindow.recent
     @State private var hoveredDate: Date?
@@ -16,11 +16,22 @@ struct StatisticsView: View {
     @State private var deleting: StudyInterval?
     @State private var error: String?
     private let teal = Color(red: 0.18, green: 0.65, blue: 0.57)
-    private var studyCalendar: StudyCalendar { StudyCalendar() }
+    private var studyCalendar: StudyCalendar { model.studyCalendar }
+    private var date: Date { selection.date }
+    private var detailDate: Date { isTimeline ? date : selection.detailDate }
+    private var dateBinding: Binding<Date> {
+        Binding(get: { selection.date }, set: { selection.navigate(to: $0) })
+    }
+    private var layoutBinding: Binding<StatisticsLayout> {
+        Binding(get: { model.preferences.statisticsLayout }, set: { layout in
+            if layout == .timeline { model.synchronizeTime(); showToday() }
+            model.preferences.statisticsLayout = layout
+        })
+    }
     private var entries: [StudyInterval] {
-        var values = model.entries(on: date, live: model.engine.liveInterval)
+        var values = model.entries(on: detailDate, live: model.engine.liveInterval)
         if let id = model.activeID, let start = model.engine.state.activeStart,
-           studyCalendar.dayStart(for: start) == date, !values.contains(where: { $0.id == id }) {
+           studyCalendar.dayStart(for: start) == detailDate, !values.contains(where: { $0.id == id }) {
             values.append(StudyInterval(id: id, start: start, end: start))
         }
         return values
@@ -28,19 +39,22 @@ struct StatisticsView: View {
     private var isTimeline: Bool { model.preferences.statisticsLayout == .timeline }
 
     var body: some View {
-        page(now: Date())
+        page(now: model.now)
         .frame(minWidth: 780, minHeight: 540)
+        .onAppear { showToday() }
+        .onChange(of: model.statisticsPresentation) { _, _ in showToday() }
         .onChange(of: model.preferences.statisticsLayout) { _, layout in
             hoveredDate = nil
-            if layout == .trend && trendPeriod == .week { date = studyCalendar.dayStart(for: Date()) }
+            if layout == .trend && trendPeriod == .week { showToday() }
         }
         .onChange(of: trendPeriod) { _, period in
             hoveredDate = nil
-            if period == .week { date = studyCalendar.dayStart(for: Date()) }
+            if period == .week { showToday() }
+            else { selection.navigate(to: date) }
         }
         .onChange(of: weekWindow) { _, _ in
             hoveredDate = nil
-            date = studyCalendar.dayStart(for: Date())
+            showToday()
         }
         .onChange(of: deleting != nil) { _, presented in model.modalDepth = max(0, model.modalDepth + (presented ? 1 : -1)) }
         .onChange(of: error != nil) { _, presented in model.modalDepth = max(0, model.modalDepth + (presented ? 1 : -1)) }
@@ -66,29 +80,30 @@ struct StatisticsView: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 if isTimeline {
-                    StudyDateNavigator(date: $date, now: now)
+                    StudyDateNavigator(date: dateBinding, now: now)
                 } else {
                     Picker("统计范围", selection: $trendPeriod) {
                         Text("周").tag(TrendPeriod.week)
                         Text("月").tag(TrendPeriod.month)
                     }.pickerStyle(.segmented).labelsHidden().frame(width: 88)
                     if trendPeriod == .month {
-                        StudyDateNavigator(date: $date, showsDays: false, now: now)
+                        StudyDateNavigator(date: dateBinding, showsDays: false, now: now)
                     } else {
                         Text(weekRangeTitle(now: now)).font(.headline).monospacedDigit()
                     }
                 }
                 Spacer(minLength: 8)
-                Picker("展示方式", selection: $model.preferences.statisticsLayout) {
+                Picker("展示方式", selection: layoutBinding) {
                     Text("时间段").tag(StatisticsLayout.timeline)
                     Text("趋势").tag(StatisticsLayout.trend)
                 }.pickerStyle(.segmented).labelsHidden().frame(width: 166)
                 HStack(spacing: 10) {
                     Button { runHistory(undo: true) } label: { Image(systemName: "arrow.uturn.backward") }
-                        .help("撤销记录更改").accessibilityLabel("撤销记录更改").disabled(!model.canUndo || model.isMutating)
+                        .help("撤销记录更改").accessibilityLabel("撤销记录更改").disabled(!model.canUndo || model.isMutating || model.settlementPending)
                     Button { runHistory(undo: false) } label: { Image(systemName: "arrow.uturn.forward") }
-                        .help("重做记录更改").accessibilityLabel("重做记录更改").disabled(!model.canRedo || model.isMutating)
-                    Button { addRecord() } label: { Label("补记", systemImage: "plus") }.disabled(model.isMutating)
+                        .help("重做记录更改").accessibilityLabel("重做记录更改").disabled(!model.canRedo || model.isMutating || model.settlementPending)
+                    Button { addRecord() } label: { Label("补记", systemImage: "plus") }
+                        .disabled(model.isMutating || model.settlementPending || detailDate > model.studyDay)
                 }
             }.buttonStyle(.borderless).padding(.horizontal, 24).padding(.vertical, 16)
             Divider()
@@ -100,8 +115,9 @@ struct StatisticsView: View {
                 Text("\(entries.count) 段学习记录")
             }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 24).padding(.vertical, 10)
         }
-        .onChange(of: model.studyDay) { _, today in
-            if !isTimeline && trendPeriod == .week { date = today }
+        .onChange(of: model.studyDay) { old, today in
+            hoveredDate = nil
+            selection.dayChanged(from: old, to: today)
         }
     }
 
@@ -129,7 +145,7 @@ struct StatisticsView: View {
                         .minimumScaleFactor(0.7).lineLimit(1)
                 }
                 Divider()
-                StudyCalendarView(selection: $date, compact: true, now: now)
+                StudyCalendarView(selection: dateBinding, compact: true, now: now)
                 Spacer()
             }.padding(16).frame(width: 240).background(.quaternary.opacity(0.25))
             Divider()
@@ -175,14 +191,14 @@ struct StatisticsView: View {
                 Divider()
                 HStack(alignment: .top, spacing: 28) {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("\(date.formatted(.dateTime.month().day())) 的时间轴").font(.headline)
-                        DayStudyRings(date: date, intervals: model.entries(on: date), compact: true,
+                        Text("\(detailDate.formatted(.dateTime.month().day())) 的时间轴").font(.headline)
+                        DayStudyRings(date: detailDate, intervals: model.entries(on: detailDate), compact: true,
                                       diameter: min(130, max(96, detailHeight - 66)),
                                       activeID: model.activeID,
-                                      liveReadout: model.liveAffects([date]) ? model.statisticsReadout : nil,
+                                      liveReadout: model.liveAffects([detailDate]) ? model.statisticsReadout : nil,
                                       onSelect: editRecord)
-                        liveContent(days: [date]) { _, live in
-                            Text("\(entries.count) 段 · \(TimeInput.format(model.total(on: date, live: live)))")
+                        liveContent(days: [detailDate]) { _, live in
+                            Text("\(entries.count) 段 · \(TimeInput.format(model.total(on: detailDate, live: live)))")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer(minLength: 0)
@@ -201,6 +217,7 @@ struct StatisticsView: View {
         return Chart(data) { day in
             BarMark(x: .value("日期", day.date, unit: .day), y: .value("学习小时", day.seconds / 3600), width: .ratio(0.65))
                 .foregroundStyle(teal.gradient).cornerRadius(3)
+                .opacity(day.date == detailDate ? 1 : 0.72)
                 .accessibilityLabel(day.date.formatted(.dateTime.month().day()))
                 .accessibilityValue(TimeInput.format(day.seconds))
         }
@@ -228,13 +245,15 @@ struct StatisticsView: View {
                         .frame(width: frame.width, height: frame.height)
                         .onContinuousHover { phase in
                             switch phase {
-                            case .active(let point): hoveredDate = chartDay(at: point.x, proxy: proxy, data: data)?.date
+                            case .active(let point):
+                                hoveredDate = chartDay(at: point.x, proxy: proxy, data: data)?.date
+                                if let hoveredDate { selection.preview(hoveredDate) }
                             case .ended: hoveredDate = nil
                             }
                         }
                         .onTapGesture { point in
                             if let selected = chartDay(at: point.x, proxy: proxy, data: data), selected.date <= studyCalendar.dayStart(for: now) {
-                                date = selected.date
+                                selection.navigate(to: selected.date)
                                 hoveredDate = nil
                                 model.preferences.statisticsLayout = .timeline
                             }
@@ -279,7 +298,7 @@ struct StatisticsView: View {
                 TableColumn("时长") { entry in
                     if entry.id == model.activeID {
                         ReadoutContent(readout: model.statisticsReadout) { _, live in
-                            Text(TimeInput.format(live.flatMap { studyCalendar.intervals(on: date, from: [$0]).first }?.duration ?? entry.duration)).monospacedDigit()
+                            Text(TimeInput.format(live.flatMap { studyCalendar.intervals(on: detailDate, from: [$0]).first }?.duration ?? entry.duration)).monospacedDigit()
                         }
                     } else { Text(TimeInput.format(entry.duration)).monospacedDigit() }
                 }.width(columnWidth)
@@ -289,7 +308,7 @@ struct StatisticsView: View {
                             editRecord(entry)
                         } label: { Image(systemName: "pencil") }.help("修改记录").accessibilityLabel("修改记录")
                         Button { deleting = entry } label: { Image(systemName: "trash") }.help("删除记录").accessibilityLabel("删除记录")
-                    }.buttonStyle(.borderless).disabled(entry.id == model.activeID || model.isMutating)
+                    }.buttonStyle(.borderless).disabled(entry.id == model.activeID || model.isMutating || model.settlementPending)
                 }.width(58)
             }.tableStyle(.inset(alternatesRowBackgrounds: true))
                     .id(columnWidth)
@@ -298,7 +317,7 @@ struct StatisticsView: View {
     }
     @ViewBuilder private func liveContent<Content: View>(days: [Date], @ViewBuilder content: @escaping (Date, StudyInterval?) -> Content) -> some View {
         if model.liveAffects(days) { ReadoutContent(readout: model.statisticsReadout, content: content) }
-        else { content(Date(), nil) }
+        else { content(model.now, nil) }
     }
     private func runHistory(undo: Bool) {
         Task {
@@ -322,8 +341,13 @@ struct StatisticsView: View {
         editor = model.records.first { $0.id == entry.id } ?? entry
     }
     private func addRecord() {
-        let end = min(Date(), studyCalendar.nextDay(studyCalendar.dayStart(for: date)))
+        guard detailDate <= model.studyDay else { return }
+        let end = min(model.now, studyCalendar.nextDay(studyCalendar.dayStart(for: detailDate)))
         editor = StudyInterval(start: end.addingTimeInterval(-1800), end: end, source: "manual")
+    }
+    private func showToday() {
+        hoveredDate = nil
+        selection.showToday(studyCalendar.dayStart(for: model.now))
     }
 }
 
