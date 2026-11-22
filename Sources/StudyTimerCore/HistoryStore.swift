@@ -2,29 +2,36 @@ import Foundation
 import SQLite3
 
 public struct Backup: Codable, Sendable {
-    public var version = 1
+    public var version = 2
     public var createdAt: Date
     public var intervals: [StudyInterval]
     public var timer: TimerState
     public var preferences: Preferences
-    public init(intervals: [StudyInterval], timer: TimerState, preferences: Preferences, createdAt: Date = Date()) {
+    public var pending: [PendingStudyInterval]?
+    public init(intervals: [StudyInterval], timer: TimerState, preferences: Preferences, createdAt: Date = Date(),
+                pending: [PendingStudyInterval] = []) {
         self.intervals = intervals; self.timer = timer; self.preferences = preferences; self.createdAt = createdAt
+        self.pending = pending.isEmpty ? nil : pending
     }
 
     public func validated(now: Date = Date()) throws -> Backup {
-        guard version == 1, createdAt.timeIntervalSince1970.isFinite,
+        let unresolved = pending ?? []
+        let ids = intervals.map(\.id) + unresolved.map(\.id)
+        guard version == 2 || (version == 1 && unresolved.isEmpty), createdAt.timeIntervalSince1970.isFinite,
               timer.elapsed.isFinite, timer.elapsed >= 0, timer.checkpointElapsed.isFinite,
               timer.checkpointElapsed >= 0,
               timer.target.map({ $0.isFinite && $0 > 0 && $0 <= 31_536_000 && timer.elapsed <= $0 && timer.checkpointElapsed <= $0 }) ?? true,
               preferences.glassOpacity.isFinite, (0...1).contains(preferences.glassOpacity),
               (100...800).contains(preferences.windowWidth), (38...400).contains(preferences.windowHeight),
               preferences.windowX.map(\.isFinite) ?? true, preferences.windowY.map(\.isFinite) ?? true,
-              Set(intervals.map(\.id)).count == intervals.count else { throw StudyError.invalidBackup }
+              Set(ids).count == ids.count,
+              unresolved.allSatisfy({ Self.validInterval($0.original) }) else { throw StudyError.invalidBackup }
+        // A valid backup made before the clock was corrected can be imported.
+        // Restore will put any now-future records aside.
+        let upperBound = max(now, createdAt).addingTimeInterval(1)
         let sorted = intervals.sorted { $0.start < $1.start }
         for (index, interval) in sorted.enumerated() {
-            guard interval.start.timeIntervalSince1970.isFinite, interval.end.timeIntervalSince1970.isFinite,
-                  interval.end > interval.start, interval.end <= now.addingTimeInterval(1),
-                  ["timer", "manual"].contains(interval.source) else { throw StudyError.invalidBackup }
+            guard Self.validInterval(interval), interval.end <= upperBound else { throw StudyError.invalidBackup }
             if index > 0 && sorted[index - 1].end > interval.start { throw StudyError.invalidBackup }
         }
         if timer.status == .running {
@@ -32,10 +39,13 @@ public struct Backup: Codable, Sendable {
                   timer.checkpointElapsed >= timer.elapsed else { throw StudyError.invalidBackup }
         } else if timer.activeStart != nil || timer.activeID != nil { throw StudyError.invalidBackup }
         if let checkpoint = timer.checkpoint {
-            guard checkpoint.timeIntervalSince1970.isFinite, checkpoint <= now.addingTimeInterval(1) else { throw StudyError.invalidBackup }
+            guard checkpoint.timeIntervalSince1970.isFinite, checkpoint <= upperBound else { throw StudyError.invalidBackup }
         }
         if let day = timer.studyDayStart {
             guard day.timeIntervalSince1970.isFinite else { throw StudyError.invalidBackup }
+        }
+        if let through = timer.savedThrough {
+            guard through.timeIntervalSince1970.isFinite, through <= upperBound else { throw StudyError.invalidBackup }
         }
         if let start = timer.activeStart {
             guard start.timeIntervalSince1970.isFinite, let checkpoint = timer.checkpoint, start <= checkpoint else { throw StudyError.invalidBackup }
@@ -44,6 +54,11 @@ public struct Backup: Codable, Sendable {
             guard let target = timer.target, timer.elapsed == target else { throw StudyError.invalidBackup }
         }
         return self
+    }
+
+    private static func validInterval(_ interval: StudyInterval) -> Bool {
+        interval.start.timeIntervalSince1970.isFinite && interval.end.timeIntervalSince1970.isFinite &&
+        interval.end > interval.start && ["timer", "manual"].contains(interval.source)
     }
 
     public func encoded() throws -> Data {
@@ -63,7 +78,7 @@ public final class HistoryStore {
     public private(set) var fullReadCount = 0
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    public init(directory: URL) throws {
+    public init(directory: URL, now: Date = Date()) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         guard sqlite3_open_v2(directory.appendingPathComponent("history.sqlite3").path, &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
@@ -74,8 +89,31 @@ public final class HistoryStore {
         let result = sqlite3_step(version)
         let schema = sqlite3_column_int(version, 0)
         sqlite3_finalize(version)
-        guard result == SQLITE_ROW, schema <= 1 else { throw StudyError.storage("数据库版本较新，请使用更新版本的应用") }
-        try execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS intervals (id TEXT PRIMARY KEY, start REAL NOT NULL, end REAL NOT NULL, source TEXT NOT NULL); CREATE INDEX IF NOT EXISTS intervals_start ON intervals(start); CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version=1;")
+        guard result == SQLITE_ROW, schema <= 2 else { throw StudyError.storage("数据库版本较新，请使用更新版本的应用") }
+        try execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+        try transaction {
+            try execute("""
+                CREATE TABLE IF NOT EXISTS intervals (id TEXT PRIMARY KEY, start REAL NOT NULL, end REAL NOT NULL, source TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS intervals_start ON intervals(start);
+                CREATE INDEX IF NOT EXISTS intervals_end ON intervals(end);
+                CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS pending_intervals (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                """)
+            if schema == 1 { try migrateIntervals(now: now) }
+            else if schema == 2 { try quarantineFuture(now: now) }
+            var state = try timerState()
+            let interrupted = try state.activeID.flatMap { try pending(where: $0).first } != nil
+            if state.checkpoint.map({ $0 > now }) == true || interrupted {
+                if state.status == .running { state.elapsed = state.checkpointElapsed; state.status = .paused }
+                state.activeID = nil
+                state.activeStart = nil
+                state.checkpoint = now
+                state.pauseReason = .clockRollback
+                state.savedThrough = try lastRecordedEnd()
+                try write(state)
+            }
+            try execute("PRAGMA user_version=2")
+        }
     }
     deinit { sqlite3_close(db) }
 
@@ -117,6 +155,107 @@ public final class HistoryStore {
             try write(update.state)
         }
     }
+
+    private func writePending(_ entry: PendingStudyInterval) throws {
+        let sql = "INSERT INTO pending_intervals(id,payload) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload"
+        let s = try statement(sql)
+        defer { sqlite3_finalize(s) }
+        bind(entry.id.uuidString, at: 1, to: s)
+        bind(String(decoding: try JSONEncoder().encode(entry), as: UTF8.self), at: 2, to: s)
+        guard sqlite3_step(s) == SQLITE_DONE else { throw error() }
+    }
+
+    private func pending(where id: UUID?) throws -> [PendingStudyInterval] {
+        let s = try statement(id == nil ? "SELECT payload FROM pending_intervals ORDER BY rowid" :
+                                        "SELECT payload FROM pending_intervals WHERE id=?")
+        defer { sqlite3_finalize(s) }
+        if let id { bind(id.uuidString, at: 1, to: s) }
+        var entries: [PendingStudyInterval] = []
+        while true {
+            let result = sqlite3_step(s)
+            if result == SQLITE_DONE { return entries }
+            guard result == SQLITE_ROW, let value = sqlite3_column_text(s, 0) else { throw error() }
+            entries.append(try JSONDecoder().decode(PendingStudyInterval.self, from: Data(String(cString: value).utf8)))
+        }
+    }
+
+    public func pendingIntervals() throws -> [PendingStudyInterval] { try pending(where: nil) }
+
+    private func removePending(_ id: UUID) throws {
+        let s = try statement("DELETE FROM pending_intervals WHERE id=?")
+        defer { sqlite3_finalize(s) }
+        bind(id.uuidString, at: 1, to: s)
+        guard sqlite3_step(s) == SQLITE_DONE else { throw error() }
+    }
+
+    private func quarantine(_ entry: StudyInterval) throws {
+        try writePending(PendingStudyInterval(original: entry))
+        try delete(id: entry.id)
+    }
+
+    private func migrateIntervals(now: Date) throws {
+        let rows = try readIntervals(sql: """
+            SELECT id,start,end,source FROM intervals
+            ORDER BY CASE source WHEN 'manual' THEN 0 ELSE 1 END, rowid
+            """)
+        try execute("DELETE FROM intervals")
+        for entry in rows {
+            do {
+                try validateInDatabase(entry, now: now)
+                try write(entry)
+            } catch StudyError.futureInterval {
+                try writePending(PendingStudyInterval(original: entry))
+            } catch StudyError.overlapping {
+                try writePending(PendingStudyInterval(original: entry))
+            }
+        }
+    }
+
+    private func quarantineFuture(now: Date) throws {
+        for entry in try readIntervals(sql: "SELECT id,start,end,source FROM intervals WHERE end>?", date: now) {
+            try quarantine(entry)
+        }
+    }
+
+    private func lastRecordedEnd() throws -> Date? {
+        let s = try statement("SELECT MAX(end) FROM intervals")
+        defer { sqlite3_finalize(s) }
+        guard sqlite3_step(s) == SQLITE_ROW else { throw error() }
+        if sqlite3_column_type(s, 0) == SQLITE_NULL { return nil }
+        return Date(timeIntervalSince1970: sqlite3_column_double(s, 0))
+    }
+
+    /// Resolve queued checkpoints and the clock interruption in one commit.
+    @discardableResult public func recoverClock(_ update: TimerUpdate, following queued: [TimerUpdate]) throws -> Date? {
+        guard let correction = update.clockCorrection else { throw StudyError.storage("缺少校时数据") }
+        var state = update.state
+        try transaction {
+            let active = update.interval
+            for item in queued {
+                if let interval = item.interval, interval.id != active?.id, interval.duration > 0 {
+                    try write(interval)
+                }
+            }
+            if let active { try delete(id: active.id) }
+            try quarantineFuture(now: correction.now)
+            if var confirmed = active {
+                let end = min(confirmed.end, correction.now, correction.confirmedThrough)
+                if end > confirmed.start {
+                    let candidate = StudyInterval(id: confirmed.id, start: confirmed.start, end: end, source: confirmed.source)
+                    confirmed.end = max(confirmed.start, min(end, try firstOverlap(candidate) ?? end))
+                } else { confirmed.end = confirmed.start }
+                if confirmed.duration > 0 { try write(confirmed) }
+                if let active, active.end > confirmed.end {
+                    let remainder = StudyInterval(id: confirmed.duration > 0 ? correction.remainderID : active.id,
+                                                  start: confirmed.end, end: active.end, source: active.source)
+                    try writePending(PendingStudyInterval(original: remainder))
+                }
+            }
+            state.savedThrough = try lastRecordedEnd()
+            try write(state)
+        }
+        return state.savedThrough
+    }
     public func timerState() throws -> TimerState {
         let s = try statement("SELECT value FROM metadata WHERE key='timer'")
         defer { sqlite3_finalize(s) }
@@ -127,8 +266,12 @@ public final class HistoryStore {
     }
     public func intervals() throws -> [StudyInterval] {
         fullReadCount += 1
-        let s = try statement("SELECT id,start,end,source FROM intervals ORDER BY start")
+        return try readIntervals(sql: "SELECT id,start,end,source FROM intervals ORDER BY start")
+    }
+    private func readIntervals(sql: String, date: Date? = nil) throws -> [StudyInterval] {
+        let s = try statement(sql)
         defer { sqlite3_finalize(s) }; var result: [StudyInterval] = []
+        if let date { sqlite3_bind_double(s, 1, date.timeIntervalSince1970) }
         while true {
             let status = sqlite3_step(s)
             if status == SQLITE_DONE { return result }
@@ -154,14 +297,18 @@ public final class HistoryStore {
     }
     private func validateInDatabase(_ interval: StudyInterval, now: Date) throws {
         try Self.validate(interval, against: [], now: now)
-        let s = try statement("SELECT 1 FROM intervals WHERE id<>? AND start<? AND end>? LIMIT 1")
+        if try firstOverlap(interval) != nil { throw StudyError.overlapping }
+    }
+    private func firstOverlap(_ interval: StudyInterval) throws -> Date? {
+        let s = try statement("SELECT start FROM intervals INDEXED BY intervals_end WHERE id<>? AND start<? AND end>? ORDER BY start LIMIT 1")
         defer { sqlite3_finalize(s) }
         bind(interval.id.uuidString, at: 1, to: s)
         sqlite3_bind_double(s, 2, interval.end.timeIntervalSince1970)
         sqlite3_bind_double(s, 3, interval.start.timeIntervalSince1970)
         let status = sqlite3_step(s)
-        if status == SQLITE_ROW { throw StudyError.overlapping }
+        if status == SQLITE_ROW { return Date(timeIntervalSince1970: sqlite3_column_double(s, 0)) }
         guard status == SQLITE_DONE else { throw error() }
+        return nil
     }
     public func interval(id: UUID) throws -> StudyInterval? {
         let s = try statement("SELECT start,end,source FROM intervals WHERE id=?")
@@ -174,7 +321,10 @@ public final class HistoryStore {
     }
     public func apply(_ change: RecordChange, now: Date = Date()) throws {
         guard change.before != nil || change.after != nil,
-              change.before == nil || change.after == nil || change.before?.id == change.after?.id else {
+              [change.before?.id, change.after?.id, change.pendingBefore?.id, change.pendingAfter?.id]
+                .compactMap({ $0 }).allSatisfy({ $0 == change.id }),
+              change.before == nil || change.pendingBefore == nil,
+              change.after == nil || change.pendingAfter == nil else {
             throw StudyError.invalidInterval
         }
         try transaction {
@@ -186,8 +336,18 @@ public final class HistoryStore {
                     abs(current.end.timeIntervalSince(before.end)) < 0.000001
             } else { matches = current == nil && change.before == nil }
             guard matches else { throw StudyError.storage("记录已经变化，请重新打开后再试") }
-            if let after = change.after { try validateInDatabase(after, now: now); try write(after) }
+            guard try pending(where: change.id).first == change.pendingBefore else {
+                throw StudyError.storage("待校对记录已经变化")
+            }
+            if let after = change.after {
+                if let original = change.pendingBefore, abs(after.duration - original.duration) > 0.000001 {
+                    throw StudyError.invalidInterval
+                }
+                try validateInDatabase(after, now: now); try write(after)
+            }
             else { try delete(id: change.id) }
+            if let entry = change.pendingAfter { try writePending(entry) }
+            else if change.pendingBefore != nil { try removePending(change.id) }
         }
     }
     public func delete(id: UUID) throws {
@@ -202,8 +362,15 @@ public final class HistoryStore {
         if state.target.map({ state.elapsed >= $0 }) == true { state.status = .completed }
         state.activeStart = nil; state.activeID = nil
         try transaction {
-            try execute("DELETE FROM intervals")
+            try execute("DELETE FROM intervals; DELETE FROM pending_intervals")
             for interval in backup.intervals { try write(interval) }
+            for entry in backup.pending ?? [] { try writePending(entry) }
+            try quarantineFuture(now: now)
+            if state.checkpoint.map({ $0 > now }) == true {
+                state.checkpoint = now
+                state.pauseReason = .clockRollback
+            }
+            if state.savedThrough.map({ $0 > now }) == true { state.savedThrough = try lastRecordedEnd() }
             try write(state)
         }
     }

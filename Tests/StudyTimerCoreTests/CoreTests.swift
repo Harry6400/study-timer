@@ -133,6 +133,19 @@ struct StoreTests {
         let backup = Backup(intervals: [], timer: TimerState(), preferences: prefs)
         #expect(try Backup.decode(backup.encoded()).preferences.statisticsLayout == .trend)
     }
+    @Test func testDailyGoalUsesExactSecondsAndDecodesOlderPreferences() throws {
+        let legacy = try JSONDecoder().decode(Preferences.self, from: Data("{\"theme\":\"dark\"}".utf8))
+        #expect(legacy.dailyGoalMinutes == 480)
+        #expect(!legacy.hasReachedDailyGoal(seconds: 28_799))
+        #expect(legacy.hasReachedDailyGoal(seconds: 28_800))
+        #expect(legacy.hasReachedDailyGoal(seconds: 28_801))
+        var preferences = legacy
+        preferences.dailyGoalMinutes = 510
+        #expect(!preferences.hasReachedDailyGoal(seconds: 28_801))
+        #expect(preferences.hasReachedDailyGoal(seconds: 30_600))
+        let backup = Backup(intervals: [], timer: TimerState(), preferences: preferences)
+        #expect(try Backup.decode(backup.encoded()).preferences.dailyGoalMinutes == 510)
+    }
     private func withStore(_ body: (HistoryStore) throws -> Void) throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: url) }

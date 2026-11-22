@@ -199,7 +199,7 @@ final class TimerPanel: NSPanel {
     }
     private var badgeReadings: [(String, String)] {
         var values: [(String, String)] = []
-        if let elapsed = model.pauseElapsed { values.append(("暂停", TimeInput.format(elapsed))) }
+        if let elapsed = model.pauseElapsed { values.append((model.engine.state.pauseReason?.title ?? "暂停", TimeInput.format(elapsed))) }
         if model.preferences.showTodayTotalOnFloatingWindow { values.append(("今日", TimeInput.format(model.todayTotal))) }
         return values
     }
@@ -224,7 +224,7 @@ final class TimerPanel: NSPanel {
         for index in badges.indices {
             let item = badges[index]
             if panel.isVisible && index < readings.count {
-                item.panel.title = readings[index].0 == "暂停" ? "暂停计时" : "今日累计"
+                item.panel.title = readings[index].0 == "今日" ? "今日累计" : readings[index].0
                 item.view.update(title: readings[index].0, value: readings[index].1, preferences: model.preferences)
                 if item.panel.level != panel.level { item.panel.level = panel.level }
                 if needsGeometry && item.panel.frame != frames[index] { item.panel.setFrame(frames[index], display: true) }
@@ -299,13 +299,13 @@ private struct ControlsView: View {
             TextField("时间", text: $input)
                 .font(.system(size: 23, weight: .medium)).textFieldStyle(.plain)
                 .focused($focused).onSubmit(start).accessibilityLabel("计时时间")
-                .disabled(model.settlementPending)
+                .disabled(model.timerWriteBlocked)
             Divider()
             HStack(spacing: 10) {
                 control(model.isRunning ? "pause.fill" : "play.fill", model.isRunning ? "暂停" : "继续", model.toggle)
-                    .disabled(model.settlementPending)
+                    .disabled(model.timerWriteBlocked)
                 control("arrow.counterclockwise", "重置", model.reset)
-                    .disabled(model.settlementPending)
+                    .disabled(model.timerWriteBlocked)
                 control("chart.bar.xaxis", "学习统计", statistics)
                 control("gearshape", "设置", settings)
                 control(model.preferences.alwaysOnTop ? "pin.fill" : "pin.slash", "切换置顶") { model.preferences.alwaysOnTop.toggle() }
@@ -323,6 +323,16 @@ private struct ControlsView: View {
                     .accessibilityValue(model.preferences.showTodayTotalOnFloatingWindow ? "已开启" : "已关闭")
                 Spacer(); Text(model.statusText).foregroundStyle(.secondary)
             }.font(.system(size: 12))
+            if !model.isRunning, model.engine.state.pauseReason != nil, !model.timerWriteBlocked {
+                VStack(alignment: .leading, spacing: 3) {
+                    if let saved = model.engine.state.savedThrough {
+                        Text("记录已保存至 \(saved.formatted(.dateTime.month().day().hour().minute().second()))")
+                    }
+                    if !model.pendingIntervals.isEmpty {
+                        Text("待校对 \(TimeInput.format(model.pendingIntervals.reduce(0) { $0 + $1.duration }))")
+                    }
+                }.font(.caption).foregroundStyle(.secondary)
+            }
             if let error { Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true) }
             if let message = model.message {
                 HStack(alignment: .top) {

@@ -3,9 +3,17 @@ import Foundation
 public struct RecordChange: Equatable, Sendable {
     public let before: StudyInterval?
     public let after: StudyInterval?
-    public var id: UUID { (after ?? before!).id }
-    public var reversed: RecordChange { RecordChange(before: after, after: before) }
-    public init(before: StudyInterval?, after: StudyInterval?) { self.before = before; self.after = after }
+    public let pendingBefore: PendingStudyInterval?
+    public let pendingAfter: PendingStudyInterval?
+    public var id: UUID { after?.id ?? before?.id ?? pendingBefore?.id ?? pendingAfter!.id }
+    public var reversed: RecordChange {
+        RecordChange(before: after, after: before, pendingBefore: pendingAfter, pendingAfter: pendingBefore)
+    }
+    public init(before: StudyInterval?, after: StudyInterval?, pendingBefore: PendingStudyInterval? = nil,
+                pendingAfter: PendingStudyInterval? = nil) {
+        self.before = before; self.after = after
+        self.pendingBefore = pendingBefore; self.pendingAfter = pendingAfter
+    }
 }
 
 public struct RecordHistory: Sendable {

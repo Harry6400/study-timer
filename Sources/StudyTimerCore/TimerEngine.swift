@@ -23,9 +23,13 @@ public final class TimerEngine {
     private let time: any TimeSource
     private var calendar: StudyCalendar
     private var anchor: TimeInterval?
+    private var lastWall: Date
+    private var lastContinuous: TimeInterval
 
     public init(state: TimerState = TimerState(), time: any TimeSource = SystemTimeSource(), calendar: StudyCalendar = StudyCalendar()) {
         self.state = state; self.time = time; self.calendar = calendar
+        lastWall = time.date
+        lastContinuous = time.continuousSeconds
         self.state.studyDayStart = state.studyDayStart ?? calendar.dayStart(for: state.activeStart ?? state.checkpoint ?? time.date)
         if time.date >= nextStudyDayBoundary {
             // 程序未运行期间不补算：只截取已经保存的检查点段。
@@ -72,8 +76,41 @@ public final class TimerEngine {
             part.end = min(part.end, nextStudyDayBoundary)
             clipped = part.end > part.start ? part : nil
         }
-        return TimerUpdate(state: freshState(), interval: clipped, isDaySettlement: true)
+        var settled = freshState()
+        settled.pauseReason = .daySettlement
+        settled.savedThrough = clipped?.end ?? state.savedThrough
+        return TimerUpdate(state: settled, interval: clipped, isDaySettlement: true)
     }
+
+    /// Compare consecutive wall and monotonic samples before processing deadlines.
+    public func checkClock(lastRecordedEnd: Date? = nil) -> TimerUpdate? {
+        let wall = time.date
+        let continuous = time.continuousSeconds
+        let confirmed = lastWall
+        let drift = wall.timeIntervalSince(lastWall) - (continuous - lastContinuous)
+        lastWall = wall
+        lastContinuous = continuous
+        // Allow observation jitter and small wall-clock slews.
+        let interval = projectedInterval
+        guard drift < -0.5 || (interval?.end.timeIntervalSince(wall) ?? 0) > 0.5 ||
+              lastRecordedEnd.map({ $0 > wall }) == true else { return nil }
+        if state.status == .running {
+            state.elapsed = elapsed
+            state.status = .paused
+        }
+        state.activeID = nil
+        state.activeStart = nil
+        state.checkpoint = wall
+        state.checkpointElapsed = state.elapsed
+        state.pauseReason = .clockRollback
+        if let through = state.savedThrough, through > wall { state.savedThrough = nil }
+        anchor = nil
+        var update = TimerUpdate(state: state, interval: interval)
+        update.clockCorrection = ClockCorrection(now: wall, confirmedThrough: confirmed)
+        return update
+    }
+
+    public func finishClockRecovery(savedThrough: Date?) { state.savedThrough = savedThrough }
 
     public var elapsed: TimeInterval {
         let value = state.elapsed + (anchor.map { max(0, time.continuousSeconds - $0) } ?? 0)
@@ -83,6 +120,12 @@ public final class TimerEngine {
         TimeInput.format(state.target.map { max(0, $0 - elapsed) } ?? elapsed, roundUp: state.target != nil)
     }
     public var liveInterval: StudyInterval? {
+        guard var interval = projectedInterval else { return nil }
+        let wall = time.date
+        if interval.end > wall, interval.end.timeIntervalSince(wall) <= 0.5 { interval.end = wall }
+        return interval.end > interval.start ? interval : nil
+    }
+    private var projectedInterval: StudyInterval? {
         guard state.status == .running, let start = state.activeStart, let id = state.activeID else { return nil }
         let end = start.addingTimeInterval(max(0, elapsed - state.elapsed))
         return end > start ? StudyInterval(id: id, start: start, end: end) : nil
@@ -95,7 +138,9 @@ public final class TimerEngine {
         var saved = state
         let interval: StudyInterval?
         if state.status == .running, let start = state.activeStart, let id = state.activeID {
-            let end = start.addingTimeInterval(max(0, current - state.elapsed))
+            let projected = start.addingTimeInterval(max(0, current - state.elapsed))
+            let wall = time.date
+            let end = projected.timeIntervalSince(wall) <= 0.5 ? min(projected, wall) : projected
             interval = end > start ? StudyInterval(id: id, start: start, end: end) : nil
             saved.status = state.target.map { current >= $0 } == true ? .completed : .paused
         } else { interval = nil }
@@ -116,6 +161,10 @@ public final class TimerEngine {
         if let settled, !allowNewDay { return settled }
         guard state.status != .running else { return checkpoint() }
         if state.status == .completed { state.elapsed = 0 }
+        if state.pauseReason == .clockRollback {
+            // A manually resumed segment belongs to the corrected wall-clock day.
+            state.studyDayStart = calendar.dayStart(for: time.date)
+        }
         beginSegment()
         return TimerUpdate(state: state, interval: settled?.interval)
     }
@@ -124,15 +173,18 @@ public final class TimerEngine {
         state.status = .running; state.activeStart = time.date; state.activeID = UUID()
         state.checkpoint = time.date; state.checkpointElapsed = state.elapsed
         anchor = time.continuousSeconds
+        state.pauseReason = nil
     }
 
-    @discardableResult public func pause() -> TimerUpdate {
+    @discardableResult public func pause(reason: PauseReason? = nil) -> TimerUpdate {
         if let settled = settleDayIfNeeded() { return settled }
         let interval = liveInterval
         let current = elapsed
         if state.status == .running {
             state.status = state.target.map { current >= $0 } == true ? .completed : .paused
             state.elapsed = current; state.activeStart = nil; state.activeID = nil; anchor = nil
+            state.pauseReason = state.status == .paused ? reason : nil
+            state.savedThrough = interval?.end ?? state.savedThrough
         }
         state.checkpoint = time.date; state.checkpointElapsed = state.elapsed
         return TimerUpdate(state: state, interval: interval)

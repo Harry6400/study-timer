@@ -5,23 +5,32 @@ import StudyTimerCore
 struct DayStudyRings: View {
     let date: Date
     let intervals: [StudyInterval]
+    let calendar: StudyCalendar
+    let today: Date
+    let clockReadout: LiveReadout
     var compact = false
     var diameter: CGFloat = 190
     var activeID: UUID?
     var liveReadout: LiveReadout?
+    var highlightedID: UUID?
     var selection: Binding<StudyInterval>?
+    var locksDuration = false
     var onSelect: ((StudyInterval) -> Void)?
+    var onVacantTime: ((Date) -> Void)?
     var onDragEnded: ((Date) -> Void)?
 
     var body: some View {
         GeometryReader { geometry in
             let gap: CGFloat = compact ? 8 : 28
             let size = min(diameter, (geometry.size.width - gap) / 2)
+            let clock = StudyClock(day: date, calendar: calendar)
             HStack(spacing: gap) {
                 ForEach(0..<2) { ring in
-                    StudyRing(clock: StudyClock(day: date), ring: ring, intervals: intervals,
-                              compact: compact, activeID: activeID, liveReadout: liveReadout, selection: selection,
-                              onSelect: onSelect, onDragEnded: onDragEnded)
+                    StudyRing(clock: clock, ring: ring, intervals: intervals,
+                              compact: compact, activeID: activeID, liveReadout: liveReadout,
+                              clockReadout: clock.day == today ? clockReadout : nil, selection: selection,
+                              highlightedID: highlightedID, locksDuration: locksDuration,
+                              onSelect: onSelect, onVacantTime: onVacantTime, onDragEnded: onDragEnded)
                         .frame(width: size, height: size)
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -41,20 +50,44 @@ private struct ClockArc: Shape {
     }
 }
 
+private struct StudyArcStroke: View {
+    let range: ClosedRange<Double>
+    let radius: CGFloat
+    let inset: CGFloat
+    let lineWidth: CGFloat
+    let paint: AngularGradient
+    var selected = false
+
+    var body: some View {
+        let outerWidth = lineWidth + (selected ? 2 : 1.5)
+        let secondsPerPoint = StudyClock.halfDay / (2 * Double.pi * radius)
+        let padding = outerWidth / 2 * secondsPerPoint
+        let rounded = range.upperBound - range.lowerBound > 2 * padding
+        let path = ClockArc(range: rounded ? (range.lowerBound + padding)...(range.upperBound - padding) : range,
+                            inset: inset)
+        let cap: CGLineCap = rounded ? .round : .butt
+        return ZStack {
+            path.stroke(Color.primary.opacity(selected ? 0.7 : 0.3), style: StrokeStyle(lineWidth: outerWidth, lineCap: cap))
+            path.stroke(paint, style: StrokeStyle(lineWidth: lineWidth, lineCap: cap))
+        }
+    }
+}
+
 private struct LiveRingArc: View {
     @ObservedObject var readout: LiveReadout
     let clock: StudyClock
     let ring: Int
     let inset: CGFloat
     let lineWidth: CGFloat
+    let radius: CGFloat
     let gradient: AngularGradient
+    let highlightedID: UUID?
     var body: some View {
         if let live = readout.interval, let range = clock.clippedOffsets(live, ring: ring) {
-            let arc = ClockArc(range: range, inset: inset)
-            ZStack {
-                arc.stroke(Color.primary.opacity(0.28), style: StrokeStyle(lineWidth: lineWidth + 1.5, lineCap: .butt))
-                arc.stroke(gradient, style: StrokeStyle(lineWidth: lineWidth, lineCap: .butt))
-            }.allowsHitTesting(false).accessibilityLabel("计时中的学习记录")
+            StudyArcStroke(range: range, radius: radius, inset: inset, lineWidth: lineWidth,
+                           paint: gradient, selected: highlightedID == live.id)
+                .opacity(highlightedID != nil && highlightedID != live.id ? 0.5 : 1)
+                .allowsHitTesting(false).accessibilityLabel("计时中的学习记录")
         }
     }
 }
@@ -73,9 +106,14 @@ private struct StudyRing: View {
     let compact: Bool
     let activeID: UUID?
     let liveReadout: LiveReadout?
+    let clockReadout: LiveReadout?
     let selection: Binding<StudyInterval>?
+    let highlightedID: UUID?
+    let locksDuration: Bool
     let onSelect: ((StudyInterval) -> Void)?
+    let onVacantTime: ((Date) -> Void)?
     let onDragEnded: ((Date) -> Void)?
+    @Environment(\.colorScheme) private var colorScheme
     @State private var dragState: RingDragState?
 
     private var lower: Double { Double(ring) * StudyClock.halfDay }
@@ -83,7 +121,7 @@ private struct StudyRing: View {
     private var inset: CGFloat { compact ? 19 : 32 }
     private var lineWidth: CGFloat { compact ? 9 : selection == nil ? 12 : 15 }
     private var space: String { "study-clock-\(ring)" }
-    private var markers: [Double] { ring == 0 ? [4, 7.5, 12 + 10.0 / 60, 14] : [16, 17 + 40.0 / 60, 18.5, 22.75] }
+    private var markers: [Int] { StudyDayPart.markerMinutes(onRing: ring) }
     private var gradient: AngularGradient {
         // Each half keeps its own endpoint colors at the four-o'clock seam.
         let first = 4 + lower / 3600, last = first + 12
@@ -103,27 +141,46 @@ private struct StudyRing: View {
             ZStack {
                 Circle().stroke(.quaternary, lineWidth: lineWidth)
                     .padding(inset)
+                if let onVacantTime {
+                    Circle().stroke(.clear, lineWidth: lineWidth).padding(inset)
+                        .contentShape(Circle().inset(by: inset).stroke(style: StrokeStyle(lineWidth: lineWidth + 14)))
+                        .onTapGesture { point in
+                            let angle = atan2(point.y - size / 2, point.x - size / 2)
+                            if let date = clock.date(atAngle: angle, ring: ring) { onVacantTime(date) }
+                        }
+                        .accessibilityHidden(true)
+                }
                 ForEach(intervals.filter { $0.id != selection?.wrappedValue.id }) { entry in
                     if let range = clock.clippedOffsets(entry, ring: ring) {
-                        recordArc(entry, range: range).opacity(selection == nil ? 1 : 0.22)
+                        recordArc(entry, range: range, radius: radius)
+                            .opacity(selection != nil ? 0.22 : highlightedID != nil && highlightedID != entry.id ? 0.5 : 1)
                     }
                 }
                 if let liveReadout {
                     LiveRingArc(readout: liveReadout, clock: clock, ring: ring, inset: inset,
-                                lineWidth: lineWidth, gradient: gradient)
+                                lineWidth: lineWidth, radius: radius, gradient: gradient, highlightedID: highlightedID)
                 }
                 if let selection, let range = clock.clippedOffsets(selection.wrappedValue, ring: ring)
                     ?? dragState.flatMap({ clock.clippedOffsets($0.original, ring: ring) }) {
-                    arcLayers(range, selected: true)
+                    arcLayers(range, radius: radius, selected: true)
                         .opacity(clock.clippedOffsets(selection.wrappedValue, ring: ring) == nil ? 0.3 : 1)
                         .contentShape(ClockArc(range: range, inset: inset).stroke(style: StrokeStyle(lineWidth: 28, lineCap: .round)))
                         .gesture(dragGesture(target: .move, size: size))
+                        .focusable(locksDuration)
+                        .onKeyPress(keys: [.leftArrow, .rightArrow, .upArrow, .downArrow]) {
+                            locksDuration ? adjustByKey($0, target: .move) : .ignored
+                        }
                         .help("学习记录")
                 }
                 clockMarks(size: size, radius: radius)
-                centerLabel
-                    .allowsHitTesting(false)
-                if let selection {
+                if let clockReadout {
+                    ReadoutContent(readout: clockReadout) { now, _ in
+                        clockFace(now: now, size: size, radius: radius)
+                    }
+                } else {
+                    clockFace(now: nil, size: size, radius: radius)
+                }
+                if let selection, !locksDuration {
                     endpoint(.start, date: selection.wrappedValue.start, size: size, radius: radius + 15)
                     endpoint(.end, date: selection.wrappedValue.end, size: size, radius: radius - 15)
                 }
@@ -131,17 +188,13 @@ private struct StudyRing: View {
         }
     }
 
-    private func arcLayers(_ range: ClosedRange<Double>, selected: Bool = false) -> some View {
-        let arc = ClockArc(range: range, inset: inset)
-        return ZStack {
-            arc.stroke(Color.primary.opacity(selected ? 0.65 : 0.28), style: StrokeStyle(lineWidth: lineWidth + 1.5, lineCap: .butt))
-            arc.stroke(gradient, style: StrokeStyle(lineWidth: lineWidth, lineCap: .butt))
-        }
+    private func arcLayers(_ range: ClosedRange<Double>, radius: CGFloat, selected: Bool = false) -> some View {
+        StudyArcStroke(range: range, radius: radius, inset: inset, lineWidth: lineWidth, paint: gradient, selected: selected)
     }
 
-    private func recordArc(_ entry: StudyInterval, range: ClosedRange<Double>) -> some View {
-        arcLayers(range)
-            .contentShape(ClockArc(range: range, inset: inset).stroke(style: StrokeStyle(lineWidth: 24, lineCap: .round)))
+    private func recordArc(_ entry: StudyInterval, range: ClosedRange<Double>, radius: CGFloat) -> some View {
+        arcLayers(range, radius: radius, selected: highlightedID == entry.id)
+            .contentShape(ClockArc(range: range, inset: inset).stroke(style: StrokeStyle(lineWidth: lineWidth + 10)))
             .onTapGesture { if entry.id != activeID { onSelect?(entry) } }
             .help("\(entry.start.formatted(date: .omitted, time: .standard))–\(entry.end.formatted(date: .omitted, time: .standard))\(entry.id == activeID ? " · 计时中" : "")")
             .accessibilityElement(children: .ignore)
@@ -151,12 +204,63 @@ private struct StudyRing: View {
             .accessibilityAction { if entry.id != activeID { onSelect?(entry) } }
     }
 
-    private var centerLabel: some View {
-        VStack(spacing: compact ? 2 : 4) {
-            Text(ring == 0 ? "04:00" : "16:00").fontWeight(.medium)
-            Text("—").foregroundStyle(.tertiary)
-            Text(ring == 0 ? "16:00" : "次日04:00")
+    @ViewBuilder private func clockFace(now: Date?, size: CGFloat, radius: CGFloat) -> some View {
+        if let now, let offset = clock.currentOffset(at: now, ring: ring) {
+            let components = clock.calendar.calendar.dateComponents([.hour, .minute], from: now)
+            let time = String(format: "%02d:%02d", components.hour ?? 0, components.minute ?? 0)
+            currentTimeMarker(offset: offset, size: size, radius: radius)
+            centerLabel(currentTime: time)
+        } else {
+            centerLabel(currentTime: nil)
+        }
+    }
+
+    private func currentTimeMarker(offset: Double, size: CGFloat, radius: CGFloat) -> some View {
+        let halfBand = lineWidth / 2
+        let inner = point(offset: offset, radius: radius - halfBand - (compact ? 3 : 5), size: size)
+        let outer = point(offset: offset, radius: radius + halfBand + (compact ? 3 : 8), size: size)
+        let marker = Path { path in
+            path.move(to: inner)
+            path.addLine(to: outer)
+        }
+        let sizeOfTip: CGFloat = compact ? 2 : 3.5
+        let tangent = StudyClock.angle(for: offset) + .pi / 2
+        let vector = CGPoint(x: cos(tangent) * sizeOfTip, y: sin(tangent) * sizeOfTip)
+        let tip = Path { path in
+            path.move(to: CGPoint(x: outer.x - vector.x, y: outer.y - vector.y))
+            path.addLine(to: CGPoint(x: outer.x + vector.x, y: outer.y + vector.y))
+            path.addLine(to: point(offset: offset, radius: radius + halfBand + (compact ? 6 : 12), size: size))
+            path.closeSubpath()
+        }
+        let width: CGFloat = compact ? 2 : 2.5
+        let dark = colorScheme == .dark
+        let highlight = dark ? Color(red: 0.67, green: 0.89, blue: 1) : Color(red: 0.09, green: 0.39, blue: 0.68)
+        let outline = dark ? Color.black.opacity(0.88) : Color.white.opacity(0.96)
+        return ZStack {
+            marker.stroke(outline, style: StrokeStyle(lineWidth: width + 2, lineCap: .round))
+            marker.stroke(highlight, style: StrokeStyle(lineWidth: width, lineCap: .round))
+            tip.fill(highlight)
+            tip.stroke(outline, lineWidth: 0.75)
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func centerLabel(currentTime: String?) -> some View {
+        VStack(spacing: compact ? 3 : 6) {
+            Text(ring == 0 ? "04:00–16:00" : "16:00–次日04:00").fontWeight(.medium)
+                .lineLimit(1).minimumScaleFactor(0.75)
+            if let currentTime {
+                Text(compact ? currentTime : "当前 \(currentTime)")
+                    .font(.system(size: compact ? 10 : 14, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("当前时间")
+                    .accessibilityValue(currentTime)
+            }
         }.font(.system(size: compact ? 9 : 12)).monospacedDigit().foregroundStyle(.secondary)
+            .accessibilityElement(children: .contain)
+            .allowsHitTesting(false)
     }
 
     private func point(offset: Double, radius: CGFloat, size: CGFloat) -> CGPoint {
@@ -173,8 +277,8 @@ private struct StudyRing: View {
                     .position(x: size / 2 + cos(angle) * (radius + (compact ? 15 : 26)),
                               y: size / 2 + sin(angle) * (radius + (compact ? 15 : 26)))
             }
-            ForEach(markers, id: \.self) { hour in
-                let offset = (hour - 4) * 3600
+            ForEach(markers, id: \.self) { minute in
+                let offset = markerOffset(minute)
                 let a = point(offset: offset, radius: radius + lineWidth / 2 + 3, size: size)
                 let b = point(offset: offset, radius: radius + lineWidth / 2 + (compact ? 8 : 11), size: size)
                 Path { p in p.move(to: a); p.addLine(to: b) }
@@ -183,12 +287,16 @@ private struct StudyRing: View {
         }.allowsHitTesting(false)
         .overlay {
             // Separate hit areas let a marker reveal its time without covering the arcs.
-            ForEach(markers, id: \.self) { hour in
-                let p = point(offset: (hour - 4) * 3600, radius: radius + lineWidth / 2 + 8, size: size)
+            ForEach(markers, id: \.self) { minute in
+                let p = point(offset: markerOffset(minute), radius: radius + lineWidth / 2 + 8, size: size)
                 Color.clear.frame(width: 14, height: 14).contentShape(Circle())
-                    .position(p).help(String(format: "%02d:%02d", Int(hour) % 24, Int((hour * 60).rounded()) % 60))
+                    .position(p).help(String(format: "%02d:%02d", minute / 60, minute % 60))
             }
         }
+    }
+
+    private func markerOffset(_ minute: Int) -> Double {
+        Double(minute - StudyDayPart.earlyMorning.rawValue) * 60
     }
 
     @ViewBuilder private func endpoint(_ target: StudyClock.DragTarget, date: Date, size: CGFloat, radius: CGFloat) -> some View {
@@ -201,14 +309,17 @@ private struct StudyRing: View {
             Path { path in path.move(to: track); path.addLine(to: p) }
                 .stroke(Color.primary.opacity(0.6), lineWidth: 1)
                 .allowsHitTesting(false)
-            Text(isStart ? "起" : "止")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(isStart ? Color(nsColor: .textBackgroundColor) : .white)
-                .frame(width: 24, height: 24)
-                .background(isStart ? Color.primary : Color(red: 0.15, green: 0.55, blue: 0.49), in: Circle())
-                .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 2))
-                .contentShape(Circle().size(width: 30, height: 30).offset(x: -3, y: -3))
+            Image(systemName: isStart ? "play.fill" : "stop.fill")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(isStart ? Color.primary : .white)
+                .frame(width: 25, height: 25)
+                .background(isStart ? Color(nsColor: .windowBackgroundColor) : Color(red: 0.07, green: 0.44, blue: 0.39), in: Circle())
+                .overlay(Circle().strokeBorder(isStart ? Color.primary : Color.white.opacity(0.5), lineWidth: 1.25))
+                .frame(width: 36, height: 36)
+                .contentShape(Circle())
                 .gesture(dragGesture(target: target, size: size))
+                .focusable()
+                .onKeyPress(keys: [.leftArrow, .rightArrow, .upArrow, .downArrow]) { adjustByKey($0, target: target) }
                 .help(isStart ? "开始时间" : "结束时间")
                 .accessibilityLabel(isStart ? "开始时间" : "结束时间")
                 .accessibilityValue(date.formatted())
@@ -220,6 +331,17 @@ private struct StudyRing: View {
                 .opacity(visible ? 1 : 0.45)
                 .position(p)
         }
+    }
+
+    private func adjustByKey(_ key: KeyPress, target: StudyClock.DragTarget) -> KeyPress.Result {
+        guard let selection else { return .ignored }
+        let fine = key.modifiers.contains(.option)
+        let forward = key.key == .rightArrow || key.key == .upArrow
+        selection.wrappedValue = StudyClock.adjusted(selection.wrappedValue, target: target,
+                                                     seconds: (forward ? 1 : -1) * (fine ? 1 : 60), fine: fine)
+        let date = target == .end ? selection.wrappedValue.end.addingTimeInterval(-0.001) : selection.wrappedValue.start
+        onDragEnded?(date)
+        return .handled
     }
 
     private func dragGesture(target: StudyClock.DragTarget, size: CGFloat) -> some Gesture {
@@ -255,30 +377,33 @@ struct IntervalEditor: View {
     @ObservedObject var model: AppModel
     @State private var interval: StudyInterval
     @State private var day: Date
-    @State private var precise = false
+    let pending: PendingStudyInterval?
     @State private var error: String?
 
-    init(interval: StudyInterval, model: AppModel) {
+    init(interval: StudyInterval, model: AppModel, pending: PendingStudyInterval? = nil) {
         self.model = model
+        self.pending = pending
         _interval = State(initialValue: interval)
-        _day = State(initialValue: StudyCalendar().dayStart(for: interval.start))
+        _day = State(initialValue: model.studyCalendar.dayStart(for: interval.start))
     }
     private var validationError: String? {
-        do { try HistoryStore.validate(interval, against: model.liveRecords); return nil }
+        do { try HistoryStore.validate(interval, against: model.liveRecords, now: model.now); return nil }
         catch { return error.localizedDescription }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
-                Text(model.records.contains(where: { $0.id == interval.id }) ? "修改学习记录" : "补记学习记录").font(.title2.weight(.semibold))
+                Text(pending != nil ? "校对学习记录" : model.records.contains(where: { $0.id == interval.id }) ? "修改学习记录" : "补记学习记录")
+                    .font(.title2.weight(.semibold))
                 Spacer()
                 Text(TimeInput.format(interval.duration)).font(.title3.weight(.semibold)).monospacedDigit()
             }
-            StudyDateNavigator(date: $day)
-            DayStudyRings(date: day, intervals: model.liveRecords, diameter: 270,
-                          selection: $interval, onDragEnded: { focus in
-                let calendar = StudyCalendar()
+            StudyDateNavigator(date: $day, now: model.now)
+            DayStudyRings(date: day, intervals: model.liveRecords, calendar: model.studyCalendar,
+                          today: model.studyDay, clockReadout: model.statisticsReadout, diameter: 270,
+                          selection: $interval, locksDuration: pending != nil, onDragEnded: { focus in
+                let calendar = model.studyCalendar
                 if focus < day || focus >= calendar.nextDay(day) { day = calendar.dayStart(for: focus) }
             })
             HStack(spacing: 12) {
@@ -286,12 +411,6 @@ struct IntervalEditor: View {
                 Image(systemName: "arrow.right").foregroundStyle(.tertiary)
                 timeCard("结束", date: interval.end)
             }
-            DisclosureGroup("精确输入", isExpanded: $precise) {
-                VStack(spacing: 10) {
-                    DatePicker("开始时间", selection: $interval.start, displayedComponents: [.date, .hourAndMinute])
-                    DatePicker("结束时间", selection: $interval.end, displayedComponents: [.date, .hourAndMinute])
-                }.padding(.top, 10)
-            }.font(.callout)
             HStack {
                 if let message = validationError ?? error {
                     Text(message).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
@@ -300,10 +419,14 @@ struct IntervalEditor: View {
                 Button("取消", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction).disabled(model.isMutating)
                 Button("保存") {
                     Task {
-                        do { try await model.saveInterval(interval); dismiss() }
+                        do {
+                            if let pending { try await model.archive(pending, as: interval) }
+                            else { try await model.saveInterval(interval) }
+                            dismiss()
+                        }
                         catch { self.error = error.localizedDescription }
                     }
-                }.keyboardShortcut(.defaultAction).disabled(validationError != nil || model.isMutating)
+                }.keyboardShortcut(.defaultAction).disabled(validationError != nil || model.isMutating || model.timerWriteBlocked)
             }
         }.padding(28).frame(width: 680)
             .interactiveDismissDisabled(model.isMutating)

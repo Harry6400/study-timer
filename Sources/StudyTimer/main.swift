@@ -28,7 +28,7 @@ import StudyTimerCore
     private var terminationStarted = false
     private var occlusionObservers: [NSObjectProtocol] = []
     private var lastMenuBarTimer: Bool?
-    private var lastStatus: TimerStatus?
+    private var lastStatus: String?
     private var lastVisibility: Bool?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -99,10 +99,10 @@ import StudyTimerCore
         }
         let title = model.preferences.menuBarTimer ? model.engine.display : ""
         if statusItem.button?.title != title { statusItem.button?.title = title }
-        if lastStatus != model.engine.state.status {
+        if lastStatus != model.statusText {
             statusItem.button?.toolTip = "学习计时器 · \(model.statusText)"
             pauseItem.title = model.isRunning ? "暂停计时" : model.engine.state.status == .completed ? "重新开始" : "继续计时"
-            lastStatus = model.engine.state.status
+            lastStatus = model.statusText
         }
         if lastVisibility != floating.panel.isVisible {
             visibilityItem.title = floating.panel.isVisible ? "隐藏悬浮窗" : "显示悬浮窗"
@@ -156,6 +156,9 @@ import StudyTimerCore
             value = recordWindow
         } else { value = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: style, backing: .buffered, defer: false) }
         value.title = title; value.contentViewController = controller; value.isReleasedWhenClosed = false
+        if model.isVerification && CommandLine.arguments.contains("--verification-light") {
+            value.appearance = NSAppearance(named: .aqua)
+        }
         value.setContentSize(size)
         value.setFrameAutosaveName("StudyTimer.\(title).v1.\(model.isVerification ? "verification" : "main")")
         value.setContentSize(size); value.center(); return value

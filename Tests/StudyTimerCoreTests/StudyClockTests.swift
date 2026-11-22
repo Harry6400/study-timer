@@ -30,6 +30,24 @@ struct StudyClockTests {
         #expect(calendar.split(crossing).reduce(0) { $0 + $1.interval.duration } == crossing.duration)
     }
 
+    @Test func currentMarkerUsesTheSelectedStudyDayAndOneRingAtEachBoundary() {
+        let clock = StudyClock(day: date("2026-11-10T04:00:00+08:00"), calendar: calendar)
+        let beforeAfternoon = date("2026-11-10T15:59:59+08:00")
+        let afternoon = date("2026-11-10T16:00:00+08:00")
+        let beforeSettlement = date("2026-11-11T03:59:59+08:00")
+        let settlement = date("2026-11-11T04:00:00+08:00")
+        #expect(clock.currentOffset(at: beforeAfternoon, ring: 0) == 43_140)
+        #expect(clock.currentOffset(at: beforeAfternoon, ring: 1) == nil)
+        #expect(clock.currentOffset(at: afternoon, ring: 0) == nil)
+        #expect(clock.currentOffset(at: afternoon, ring: 1) == 43_200)
+        #expect(clock.currentOffset(at: beforeSettlement, ring: 1) == 86_340)
+        #expect(clock.currentOffset(at: settlement, ring: 1) == nil)
+        let nextClock = StudyClock(day: settlement, calendar: calendar)
+        #expect(nextClock.currentOffset(at: beforeSettlement, ring: 0) == nil)
+        #expect(nextClock.currentOffset(at: settlement, ring: 0) == 0)
+        #expect(nextClock.currentOffset(at: settlement, ring: 1) == nil)
+    }
+
     @Test func dragUnwrapsClockAndSeamInBothDirections() {
         var drag = ClockDrag(angle: 179 * .pi / 180)
         drag.update(angle: -179 * .pi / 180, fine: false)
@@ -42,6 +60,29 @@ struct StudyClockTests {
         var fine = ClockDrag(angle: 0)
         fine.update(angle: .pi / 6, fine: true)
         #expect(abs(fine.seconds - 60) < 0.000001)
+    }
+
+    @Test func supplementUsesTheVisibleDayAndStopsAtTheNextRecord() throws {
+        let day = date("2026-11-10T04:00:00+08:00")
+        let now = date("2026-11-11T13:00:00+08:00")
+        let morning = StudyInterval(start: date("2026-11-10T08:00:00+08:00"), end: date("2026-11-10T10:00:00+08:00"))
+        let evening = StudyInterval(start: date("2026-11-10T22:00:00+08:00"), end: date("2026-11-10T23:00:00+08:00"))
+        let clock = StudyClock(day: day, calendar: calendar)
+        let point = try #require(clock.date(atAngle: StudyClock.angle(for: 17.75 * 3600), ring: 1))
+        #expect(point == date("2026-11-10T21:45:00+08:00"))
+        let clicked = try #require(calendar.draft(on: day, at: point, occupied: [morning, evening], now: now))
+        #expect(clicked.start == point && clicked.end == evening.start && clicked.duration == 900)
+        let automatic = try #require(calendar.draft(on: day, occupied: [morning, evening], now: now))
+        #expect(automatic.start == evening.end && automatic.duration == 1800)
+        #expect(calendar.draft(on: day, at: evening.start, occupied: [morning, evening], now: now) == nil)
+    }
+
+    @Test func supplementWithinFirstMinutesAfterFourDoesNotBeginYesterday() throws {
+        let day = date("2026-11-10T04:00:00+08:00")
+        let now = date("2026-11-10T04:10:00+08:00")
+        let value = try #require(calendar.draft(on: day, occupied: [], now: now))
+        #expect(value.start == day && value.end == now)
+        #expect(calendar.draft(on: day, occupied: [], now: now, duration: 900, locked: true) == nil)
     }
 
     @Test func endpointSnappingAndWholeRecordMovement() {

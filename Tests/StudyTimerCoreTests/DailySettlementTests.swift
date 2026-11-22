@@ -137,7 +137,8 @@ struct DailySettlementTests {
         var state = TimerState(target: 600)
         state.elapsed = 20; state.checkpointElapsed = 20
         state.checkpoint = date("2026-11-10T02:00:00+08:00")
-        let backup = Backup(intervals: [], timer: state, preferences: Preferences(), createdAt: state.checkpoint!)
+        var backup = Backup(intervals: [], timer: state, preferences: Preferences(), createdAt: state.checkpoint!)
+        backup.version = 1
         let decoded = try Backup.decode(backup.encoded(), now: date("2026-11-10T08:00:00+08:00"))
         #expect(decoded.version == 1 && decoded.timer.studyDayStart == nil)
         let loaded = TimerEngine(state: decoded.timer, time: SettlementClock("2026-11-10T08:00:00+08:00"), calendar: calendar)

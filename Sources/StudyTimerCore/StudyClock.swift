@@ -26,6 +26,23 @@ public struct StudyClock: Sendable {
         seamAngle + offset / halfDay * 2 * .pi
     }
 
+    public func date(atAngle angle: Double, ring: Int) -> Date? {
+        let circle = 2 * Double.pi
+        let phase = (angle - Self.seamAngle).truncatingRemainder(dividingBy: circle)
+        let offset = Double(ring) * Self.halfDay + (phase < 0 ? phase + circle : phase) / circle * Self.halfDay
+        let minute = Int(offset / 60) + 240
+        let cal = calendar.calendar
+        guard let civilDay = cal.date(byAdding: .day, value: minute / 1440, to: cal.startOfDay(for: day)) else { return nil }
+        return cal.date(bySettingHour: minute / 60 % 24, minute: minute % 60, second: 0, of: civilDay)
+    }
+
+    public func currentOffset(at now: Date, ring: Int) -> Double? {
+        guard calendar.dayStart(for: now) == day else { return nil }
+        let offset = floor(offset(for: now) / 60) * 60
+        let lower = Double(ring) * Self.halfDay
+        return offset >= lower && offset < lower + Self.halfDay ? offset : nil
+    }
+
     public func clippedOffsets(_ interval: StudyInterval, ring: Int) -> ClosedRange<Double>? {
         let lower = Double(ring) * Self.halfDay, upper = lower + Self.halfDay
         let a = max(lower, offset(for: interval.start)), b = min(upper, offset(for: interval.end))
@@ -56,6 +73,41 @@ public struct StudyClock: Sendable {
             value.end = original.end.addingTimeInterval(delta)
         }
         return value
+    }
+}
+
+public extension StudyCalendar {
+    func draft(on date: Date, at point: Date? = nil, occupied: [StudyInterval], now: Date,
+               duration: TimeInterval = 1800, locked: Bool = false) -> StudyInterval? {
+        let start = dayStart(for: date)
+        let end = min(nextDay(start), now)
+        guard end.timeIntervalSince(start) >= (locked ? duration : 1) else { return nil }
+        let blocks = intervals(on: start, from: occupied).sorted { $0.start < $1.start }
+        var cursor = start
+        var gaps: [Range<Date>] = []
+        for block in blocks where block.start < end {
+            if block.start > cursor { gaps.append(cursor..<block.start) }
+            cursor = max(cursor, block.end)
+        }
+        if cursor < end { gaps.append(cursor..<end) }
+        if let point {
+            guard let gap = gaps.first(where: { $0.contains(point) }) else { return nil }
+            let length = min(duration, gap.upperBound.timeIntervalSince(point))
+            guard length >= 1, !locked || length == duration else { return nil }
+            return StudyInterval(start: point, end: point.addingTimeInterval(length), source: "manual")
+        }
+        let reference = blocks.filter { $0.end <= end }.last?.end
+            ?? calendar.date(bySettingHour: 9, minute: 0, second: 0, of: start) ?? start
+        let candidates = gaps.compactMap { gap -> StudyInterval? in
+            let length = min(duration, gap.upperBound.timeIntervalSince(gap.lowerBound))
+            guard length >= 1, !locked || length == duration else { return nil }
+            let anchor = min(max(reference, gap.lowerBound), gap.upperBound.addingTimeInterval(-length))
+            return StudyInterval(start: anchor, end: anchor.addingTimeInterval(length), source: "manual")
+        }
+        return candidates.min { lhs, rhs in
+            let a = abs(lhs.start.timeIntervalSince(reference)), b = abs(rhs.start.timeIntervalSince(reference))
+            return a == b ? lhs.start > rhs.start : a < b
+        }
     }
 }
 

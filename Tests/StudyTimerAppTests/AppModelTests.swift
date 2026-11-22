@@ -68,14 +68,52 @@ import StudyTimerCore
         let item = StudyInterval(start: .now.addingTimeInterval(-1000), end: .now.addingTimeInterval(-500), source: "manual")
         try await model.saveInterval(item)
         let backupURL = dir.appendingPathComponent("manual.json")
+        model.preferences.dailyGoalMinutes = 510
         try await model.exportBackup(to: backupURL)
+        model.preferences.dailyGoalMinutes = 480
         try await model.deleteInterval(id: item.id)
         #expect(model.canUndo && model.records.isEmpty)
         try await model.restore(from: backupURL)
+        #expect(model.preferences.dailyGoalMinutes == 510)
         #expect(model.records.count == 1 && !model.canUndo && !model.canRedo && !model.isRunning)
         #expect(abs(model.total(on: item.start) - item.duration) < 0.000001)
         #expect(try model.store.intervals().count == 1)
         await model.quit()
+    }
+    @Test func dailyGoalControlsKeepWholeMinutesWithinTheSavedRange() {
+        var draft = DailyGoalDraft(minutes: 510)
+        #expect(draft.hours == 8 && draft.minutes == 30)
+        draft.hours = 9
+        #expect(draft.totalMinutes == 570)
+        draft.hours = 24
+        draft.minutes = 59
+        #expect(draft.totalMinutes == 1440 && draft.minuteRange == 0...0)
+        draft.hours = 0
+        draft.minutes = 0
+        #expect(draft.totalMinutes == 1 && draft.minuteRange == 1...59)
+        draft.hours = 1
+        draft.minutes = 0
+        #expect(draft.totalMinutes == 60 && draft.minuteRange == 0...59)
+    }
+    @Test func studyDayPartsUseRingMarkersAndPositiveOverlap() {
+        let calendar = StudyCalendar(timeZone: TimeZone(identifier: "Asia/Shanghai")!)
+        let day = calendar.calendar.date(from: DateComponents(year: 2026, month: 11, day: 22, hour: 4))!
+        let clock = StudyClock(day: day, calendar: calendar)
+        let parts = StudyDayParts(clock: clock)
+        func names(_ start: Int, _ end: Int) -> [String] {
+            let entry = StudyInterval(start: clock.day.addingTimeInterval(Double(start - 240) * 60),
+                                      end: clock.day.addingTimeInterval(Double(end - 240) * 60))
+            return parts.names(overlapping: entry)
+        }
+        #expect(StudyDayPart.markerMinutes(onRing: 0) == [240, 450, 730, 840])
+        #expect(StudyDayPart.markerMinutes(onRing: 1) == [960, 1060, 1110, 1365])
+        #expect(names(240, 450) == ["清晨"])
+        #expect(names(450, 730) == ["上午"])
+        #expect(names(773, 897) == ["中午", "下午"])
+        #expect(names(905, 998) == ["下午"])
+        #expect(names(1080, 1117) == ["晚饭", "晚上"])
+        #expect(names(1430, 1680) == ["深夜"])
+        #expect(names(1365, 1365) == ["深夜"])
     }
     @Test func failedRestoreBackupKeepsOriginalDataAndHistory() async throws {
         let dir = folder(); defer { cleanup(dir) }

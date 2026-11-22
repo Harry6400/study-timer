@@ -14,6 +14,27 @@ public struct StudyInterval: Codable, Equatable, Identifiable, Sendable {
 
 public enum TimerStatus: String, Codable, Sendable { case paused, running, completed }
 
+public enum PauseReason: String, Codable, Sendable {
+    case manual, sleep, offline, clockRollback, daySettlement
+
+    public var title: String {
+        switch self {
+        case .manual: "手动暂停"
+        case .sleep: "休眠暂停"
+        case .offline: "断网暂停"
+        case .clockRollback: "时钟回拨"
+        case .daySettlement: "昨日已结算"
+        }
+    }
+}
+
+public struct PendingStudyInterval: Codable, Equatable, Identifiable, Sendable {
+    public let original: StudyInterval
+    public var id: UUID { original.id }
+    public var duration: TimeInterval { original.duration }
+    public init(original: StudyInterval) { self.original = original }
+}
+
 public struct TimerState: Codable, Equatable, Sendable {
     public var target: TimeInterval?
     public var elapsed: TimeInterval = 0
@@ -24,6 +45,8 @@ public struct TimerState: Codable, Equatable, Sendable {
     public var checkpointElapsed: TimeInterval = 0
     /// 这次读数所属的学习日；旧数据由活动起点或检查点推断。
     public var studyDayStart: Date?
+    public var pauseReason: PauseReason?
+    public var savedThrough: Date?
     public init(target: TimeInterval? = nil) { self.target = target }
 }
 
@@ -31,8 +54,21 @@ public struct TimerUpdate: Sendable {
     public var state: TimerState
     public var interval: StudyInterval?
     public var isDaySettlement: Bool
+    public var clockCorrection: ClockCorrection?
     public init(state: TimerState, interval: StudyInterval?, isDaySettlement: Bool = false) {
         self.state = state; self.interval = interval; self.isDaySettlement = isDaySettlement
+    }
+}
+
+public struct ClockCorrection: Sendable {
+    public let now: Date
+    public let confirmedThrough: Date
+    public let remainderID: UUID
+
+    init(now: Date, confirmedThrough: Date) {
+        self.now = now
+        self.confirmedThrough = confirmedThrough
+        self.remainderID = UUID()
     }
 }
 
@@ -46,6 +82,9 @@ public enum TimerTheme: String, Codable, CaseIterable, Sendable {
 public enum StatisticsLayout: String, Codable, Sendable { case timeline, trend }
 
 public struct Preferences: Codable, Equatable, Sendable {
+    public static let dailyGoalMinutesRange = 1...1440
+    private static let defaultDailyGoalMinutes = 8 * 60
+
     public var theme: TimerTheme = .glass
     public var glassOpacity: Double = 0.48
     public var alwaysOnTop = true
@@ -53,6 +92,7 @@ public struct Preferences: Codable, Equatable, Sendable {
     public var sound = true
     public var notifications = true
     public var statisticsLayout: StatisticsLayout = .timeline
+    public var dailyGoalMinutes: Int = Self.defaultDailyGoalMinutes
     public var showTodayTotalOnFloatingWindow = false
     public var automaticBackups = true
     public var windowX: Double?
@@ -60,9 +100,14 @@ public struct Preferences: Codable, Equatable, Sendable {
     public var windowWidth: Double = 150
     public var windowHeight: Double = 58
     public init() {}
+
+    public func hasReachedDailyGoal(seconds: TimeInterval) -> Bool {
+        seconds >= Double(dailyGoalMinutes) * 60
+    }
+
     private enum CodingKeys: String, CodingKey {
         case theme, glassOpacity, alwaysOnTop, menuBarTimer, sound, notifications, statisticsLayout, showTodayTotalOnFloatingWindow
-        case windowX, windowY, windowWidth, windowHeight, automaticBackups
+        case windowX, windowY, windowWidth, windowHeight, automaticBackups, dailyGoalMinutes
     }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -74,6 +119,9 @@ public struct Preferences: Codable, Equatable, Sendable {
         sound = try c.decodeIfPresent(Bool.self, forKey: .sound) ?? true
         notifications = try c.decodeIfPresent(Bool.self, forKey: .notifications) ?? true
         statisticsLayout = try c.decodeIfPresent(StatisticsLayout.self, forKey: .statisticsLayout) ?? .timeline
+        if let minutes = try? c.decode(Int.self, forKey: .dailyGoalMinutes), Self.dailyGoalMinutesRange.contains(minutes) {
+            dailyGoalMinutes = minutes
+        }
         showTodayTotalOnFloatingWindow = try c.decodeIfPresent(Bool.self, forKey: .showTodayTotalOnFloatingWindow) ?? false
         windowX = try c.decodeIfPresent(Double.self, forKey: .windowX)
         windowY = try c.decodeIfPresent(Double.self, forKey: .windowY)
